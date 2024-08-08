@@ -57,6 +57,7 @@ import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodType;
 import java.util.*;
 import java.util.function.Consumer;
+import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 import org.objectweb.asm.ClassReader;
@@ -316,15 +317,13 @@ public final class AotMachine implements Machine {
         System.out.println(functionCount);
 
         long start = System.currentTimeMillis();
-        RangeMap<String> functionClassRanges = new RangeMap<>();
+        RangeMap<ClassBytes> functionClassRanges = new RangeMap<>();
         List<RangeMap.Range> rangesToProcess = new ArrayList<>();
         rangesToProcess.add(new RangeMap.Range(0, functionCount - 1));
         boolean split = false;
-        Map<String, byte[]> classBytesMap = new LinkedHashMap<>();
         while (!rangesToProcess.isEmpty()) {
             List<RangeMap.Range> splitRanges =
-                    generateFunctionRangeClass(
-                            functionClassRanges, rangesToProcess.remove(0), classBytesMap);
+                    generateFunctionRangeClass(functionClassRanges, rangesToProcess.remove(0));
             if (!splitRanges.isEmpty()) {
                 split = true;
                 rangesToProcess.addAll(0, splitRanges);
@@ -332,28 +331,29 @@ public final class AotMachine implements Machine {
         }
 
         if (split) {
-            functionClassRanges
-                    .entrySet()
-                    .forEach(
-                            entry -> {
-                                generateFunctionRangeClass(
-                                        functionClassRanges, entry.getKey(), classBytesMap);
-                            });
+            List<RangeMap.Range> invalidatedRanges =
+                    functionClassRanges.entrySet().stream()
+                            .filter(entry -> entry.getValue().bytes() == null)
+                            .map(Map.Entry::getKey)
+                            .collect(Collectors.toList());
+            for (RangeMap.Range range : invalidatedRanges) {
+                generateFunctionRangeClass(functionClassRanges, range);
+            }
         }
         System.out.println("Elapsed generation time: " + (System.currentTimeMillis() - start));
 
-        for (Map.Entry<RangeMap.Range, String> entry : functionClassRanges.entrySet()) {
+        for (Map.Entry<RangeMap.Range, ClassBytes> entry : functionClassRanges.entrySet()) {
             System.out.println("Range:  " + entry.getKey() + ", class:  " + entry.getValue());
         }
 
         // TODO address this
-        this.compiledClass = classBytesMap.entrySet().iterator().next().getValue();
+        this.compiledClass = functionClassRanges.get(0).bytes();
 
         start = System.currentTimeMillis();
         Map<String, Class<?>> classes = new LinkedHashMap<>();
         ByteArrayClassLoader classLoader = new ByteArrayClassLoader(getClass().getClassLoader());
-        for (Map.Entry<String, byte[]> entry : classBytesMap.entrySet()) {
-            classes.put(entry.getKey(), loadClass(classLoader, entry.getKey(), entry.getValue()));
+        for (ClassBytes cb : functionClassRanges.values()) {
+            classes.put(cb.className(), loadClass(classLoader, cb.className(), cb.bytes()));
         }
         System.out.println("Elapsed load time: " + (System.currentTimeMillis() - start));
 
@@ -363,16 +363,16 @@ public final class AotMachine implements Machine {
     }
 
     private List<RangeMap.Range> generateFunctionRangeClass(
-            RangeMap<String> functionClassRanges,
-            RangeMap.Range functionRange,
-            Map<String, byte[]> classBytesMap) {
+            RangeMap<ClassBytes> functionClassRanges, RangeMap.Range functionRange) {
         try {
             String className = generateClassName(functionRange);
             System.out.println(
                     "Generating bytes for Range:  " + functionRange + ", class:  " + className);
-            functionClassRanges.put(functionRange, className);
+            ClassBytes cb = new ClassBytes(className);
+            functionClassRanges.put(functionRange, cb);
+            long genStartNanos = System.nanoTime();
             byte[] classBytes = compileClass(functionClassRanges, className, functionRange);
-            classBytesMap.put(className, classBytes);
+            cb.addBytes(classBytes, genStartNanos);
         } catch (ClassTooLargeException e) {
             functionClassRanges.remove(functionRange);
             int splitCount = (e.getConstantPoolCount() / CONSTANT_POOL_UPPER_THRESHOLD) + 1;
@@ -385,8 +385,21 @@ public final class AotMachine implements Machine {
                             + splitCount);
             List<RangeMap.Range> splitRanges = functionRange.split(splitCount);
             for (RangeMap.Range range : splitRanges) {
-                functionClassRanges.put(range, generateClassName(range));
+                functionClassRanges.put(range, new ClassBytes(generateClassName(range)));
             }
+            long splitEndNanos = System.nanoTime();
+            functionClassRanges.values().stream()
+                    .filter(
+                            cb ->
+                                    cb.generationTime() != null
+                                            && cb.generationTime() < splitEndNanos)
+                    .peek(
+                            cb ->
+                                    System.out.println(
+                                            "Flagging class "
+                                                    + cb.className()
+                                                    + " for re-generation."))
+                    .forEach(ClassBytes::emptyBytes);
 
             return splitRanges;
         }
@@ -442,7 +455,7 @@ public final class AotMachine implements Machine {
     }
 
     private MethodHandle[] compile(
-            RangeMap<String> functionClassRanges, Map<String, Class<?>> classMap) {
+            RangeMap<ClassBytes> functionClassRanges, Map<String, Class<?>> classMap) {
         var functions = module.functionSection();
         var compiled = new MethodHandle[functionImports + functions.functionCount()];
 
@@ -457,7 +470,7 @@ public final class AotMachine implements Machine {
                 MethodHandle handle =
                         publicLookup()
                                 .findStatic(
-                                        classMap.get(functionClassRanges.get(funcId)),
+                                        classMap.get(functionClassRanges.get(funcId).className()),
                                         methodNameFor(funcId),
                                         methodTypeFor(type));
                 handle =
@@ -491,7 +504,7 @@ public final class AotMachine implements Machine {
     }
 
     private byte[] compileClass(
-            RangeMap<String> functionClassRanges, String className, RangeMap.Range range) {
+            RangeMap<ClassBytes> functionClassRanges, String className, RangeMap.Range range) {
         var internalClassName = AotUtil.toInternalClassName(className);
         var classWriter = new ClassWriter(ClassWriter.COMPUTE_FRAMES);
         classWriter.visit(
@@ -504,11 +517,6 @@ public final class AotMachine implements Machine {
         classWriter.visitSource("wasm", "wasm");
 
         emitConstructor(classWriter);
-        System.out.println(
-                "functionImports: "
-                        + functionImports
-                        + ", functionTypes:  "
-                        + functionTypes.size());
         for (int funcId = range.getStart(); funcId <= range.getEnd(); funcId++) {
             if (funcId < functionImports) {
                 int iFuncId = funcId;
@@ -759,7 +767,7 @@ public final class AotMachine implements Machine {
     }
 
     private void compileBody(
-            RangeMap<String> functionClassMap,
+            RangeMap<ClassBytes> functionClassMap,
             String internalClassName,
             int funcId,
             FunctionType type,
@@ -1053,5 +1061,50 @@ public final class AotMachine implements Machine {
 
     public byte[] compiledClass() {
         return compiledClass;
+    }
+
+    static class ClassBytes {
+        private final String className;
+        private byte[] bytes;
+        private Long generationTime;
+
+        public ClassBytes(String className) {
+            this.className = className;
+        }
+
+        public void addBytes(byte[] bytes, long generationTime) {
+            this.bytes = bytes;
+            this.generationTime = generationTime;
+        }
+
+        public String className() {
+            return className;
+        }
+
+        public byte[] bytes() {
+            return bytes;
+        }
+
+        public Long generationTime() {
+            return generationTime;
+        }
+
+        @Override
+        public String toString() {
+            return "ClassBytes{"
+                    + "className='"
+                    + className
+                    + '\''
+                    + ", bytes.length="
+                    + bytes.length
+                    + ", generationTime="
+                    + generationTime
+                    + '}';
+        }
+
+        public void emptyBytes() {
+            this.bytes = null;
+            this.generationTime = null;
+        }
     }
 }

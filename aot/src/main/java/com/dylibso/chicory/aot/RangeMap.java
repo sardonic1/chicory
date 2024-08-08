@@ -1,6 +1,7 @@
 package com.dylibso.chicory.aot;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -46,6 +47,14 @@ public class RangeMap<V> {
      */
     public Set<Map.Entry<Range, V>> entrySet() {
         return map.entrySet();
+    }
+
+    /**
+     * Returns the values in the map in ascending order by key.
+     * @return the values
+     */
+    public Collection<V> values() {
+        return map.values();
     }
 
     /**
