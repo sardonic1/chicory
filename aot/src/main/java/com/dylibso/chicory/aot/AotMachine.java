@@ -62,6 +62,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.WeakHashMap;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.RecursiveAction;
@@ -89,6 +90,9 @@ public final class AotMachine implements Machine {
     public static final String DEFAULT_CLASS_NAME = "com.dylibso.chicory.$gen.CompiledModule";
     private static final Instruction FUNCTION_SCOPE = new Instruction(-1, OpCode.NOP, new long[0]);
     private static final int CONSTANT_POOL_UPPER_THRESHOLD = 45 * 1024;
+
+    private static final WeakHashMap<com.dylibso.chicory.runtime.Module, RangeMap<ClassBytes>>
+            MODULE_RANGE_MAP = new WeakHashMap<>();
 
     private final Module module;
     private final Instance instance;
@@ -325,7 +329,12 @@ public final class AotMachine implements Machine {
         int functionCount = functionImports + module.functionSection().functionCount();
 
         if (functionCount > 0) {
-            RangeMap<ClassBytes> funcClassBytesMap = genFuncClassBytesMap(functionCount);
+            RangeMap<ClassBytes> funcClassBytesMap = null;
+            synchronized (module) {
+                funcClassBytesMap =
+                        MODULE_RANGE_MAP.computeIfAbsent(
+                                instance.module(), m -> genFuncClassBytesMap(functionCount));
+            }
 
             long start = System.currentTimeMillis();
             this.compiledFunctions = compile(funcClassBytesMap);
