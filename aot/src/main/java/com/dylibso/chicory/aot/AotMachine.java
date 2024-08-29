@@ -55,7 +55,16 @@ import com.dylibso.chicory.wasm.types.ValueType;
 import java.io.PrintWriter;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodType;
-import java.util.*;
+import java.util.ArrayDeque;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.RecursiveAction;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
@@ -314,67 +323,77 @@ public final class AotMachine implements Machine {
         this.functionTypes = getFunctionTypes(module);
 
         int functionCount = functionImports + module.functionSection().functionCount();
-        System.out.println(functionCount);
 
-        long start = System.currentTimeMillis();
-        RangeMap<ClassBytes> functionClassRanges = new RangeMap<>();
-        List<RangeMap.Range> rangesToProcess = new ArrayList<>();
-        rangesToProcess.add(new RangeMap.Range(0, functionCount - 1));
-        boolean split = false;
-        while (!rangesToProcess.isEmpty()) {
-            List<RangeMap.Range> splitRanges =
-                    generateFunctionRangeClass(functionClassRanges, rangesToProcess.remove(0));
-            if (!splitRanges.isEmpty()) {
-                split = true;
-                rangesToProcess.addAll(0, splitRanges);
-            }
+        if (functionCount > 0) {
+            RangeMap<ClassBytes> funcClassBytesMap = genFuncClassBytesMap(functionCount);
+
+            long start = System.currentTimeMillis();
+            this.compiledFunctions = compile(funcClassBytesMap);
+            System.out.println("Elapsed compile time: " + (System.currentTimeMillis() - start));
+
+            // TODO address this
+            this.compiledClass = funcClassBytesMap.get(0).bytes();
+
+        } else {
+            this.compiledFunctions = new MethodHandle[0];
+            this.compiledClass = new byte[0];
         }
+    }
 
-        if (split) {
-            List<RangeMap.Range> invalidatedRanges =
-                    functionClassRanges.entrySet().stream()
-                            .filter(entry -> entry.getValue().bytes() == null)
+    private RangeMap<ClassBytes> genFuncClassBytesMap(int functionCount) {
+        long start = System.currentTimeMillis();
+        RangeMap<ClassBytes> funcRangeMap = new RangeMap<>();
+        Range startRange = new Range(0, functionCount - 1);
+        List<Range> splitRanges = genFuncClass(funcRangeMap, startRange);
+        ForkJoinPool pool = ForkJoinPool.commonPool();
+        if (!splitRanges.isEmpty()) {
+            pool.invoke(new FuncGenAsync(funcRangeMap, splitRanges));
+
+            // Rebuild classes invalidated by further splits
+            List<Range> invalidatedRanges =
+                    funcRangeMap.entrySet().stream()
+                            .filter(entry -> entry.getValue().isInvalid())
                             .map(Map.Entry::getKey)
                             .collect(Collectors.toList());
-            for (RangeMap.Range range : invalidatedRanges) {
-                generateFunctionRangeClass(functionClassRanges, range);
-            }
+            System.out.println("Regenerating invalid:  " + invalidatedRanges);
+            pool.invoke(new FuncGenAsync(funcRangeMap, invalidatedRanges));
         }
         System.out.println("Elapsed generation time: " + (System.currentTimeMillis() - start));
 
-        for (Map.Entry<RangeMap.Range, ClassBytes> entry : functionClassRanges.entrySet()) {
+        for (Map.Entry<Range, ClassBytes> entry : funcRangeMap.entrySet()) {
             System.out.println("Range:  " + entry.getKey() + ", class:  " + entry.getValue());
         }
 
-        // TODO address this
-        this.compiledClass = functionClassRanges.get(0).bytes();
-
         start = System.currentTimeMillis();
-        Map<String, Class<?>> classes = new LinkedHashMap<>();
         ByteArrayClassLoader classLoader = new ByteArrayClassLoader(getClass().getClassLoader());
-        for (ClassBytes cb : functionClassRanges.values()) {
-            classes.put(cb.className(), loadClass(classLoader, cb.className(), cb.bytes()));
-        }
+        Collection<Callable<Void>> loadTasks =
+                funcRangeMap.values().stream()
+                        .map(cb -> loadClassAsync(cb, classLoader))
+                        .collect(Collectors.toList());
+        pool.invokeAll(loadTasks);
         System.out.println("Elapsed load time: " + (System.currentTimeMillis() - start));
 
-        start = System.currentTimeMillis();
-        this.compiledFunctions = compile(functionClassRanges, classes);
-        System.out.println("Elapsed compile time: " + (System.currentTimeMillis() - start));
+        return funcRangeMap;
     }
 
-    private List<RangeMap.Range> generateFunctionRangeClass(
-            RangeMap<ClassBytes> functionClassRanges, RangeMap.Range functionRange) {
+    private static Callable<Void> loadClassAsync(ClassBytes cb, ByteArrayClassLoader classLoader) {
+        return () -> {
+            cb.setClass(loadClass(classLoader, cb.className(), cb.bytes()));
+            return null;
+        };
+    }
+
+    private List<Range> genFuncClass(
+            RangeMap<ClassBytes> functionClassRanges, Range functionRange) {
         try {
             String className = generateClassName(functionRange);
             System.out.println(
                     "Generating bytes for Range:  " + functionRange + ", class:  " + className);
             ClassBytes cb = new ClassBytes(className);
             functionClassRanges.put(functionRange, cb);
-            long genStartNanos = System.nanoTime();
-            byte[] classBytes = compileClass(functionClassRanges, className, functionRange);
-            cb.addBytes(classBytes, genStartNanos);
+            cb.setGenerationTime(System.nanoTime());
+            cb.setBytes(compileClass(functionClassRanges, className, functionRange));
         } catch (ClassTooLargeException e) {
-            functionClassRanges.remove(functionRange);
             int splitCount = (e.getConstantPoolCount() / CONSTANT_POOL_UPPER_THRESHOLD) + 1;
             System.out.println(
                     "Class too large ("
@@ -383,10 +402,12 @@ public final class AotMachine implements Machine {
                             + functionRange
                             + " by "
                             + splitCount);
-            List<RangeMap.Range> splitRanges = functionRange.split(splitCount);
-            for (RangeMap.Range range : splitRanges) {
+            List<Range> splitRanges = functionRange.split(splitCount);
+            //            splitRanges.add(1, splitRanges.remove(0)); // TODO remove
+            for (Range range : splitRanges) {
                 functionClassRanges.put(range, new ClassBytes(generateClassName(range)));
             }
+            functionClassRanges.remove(functionRange);
             long splitEndNanos = System.nanoTime();
             functionClassRanges.values().stream()
                     .filter(
@@ -399,7 +420,7 @@ public final class AotMachine implements Machine {
                                             "Flagging class "
                                                     + cb.className()
                                                     + " for re-generation."))
-                    .forEach(ClassBytes::emptyBytes);
+                    .forEach(ClassBytes::invalidate);
 
             return splitRanges;
         }
@@ -407,8 +428,12 @@ public final class AotMachine implements Machine {
         return Collections.emptyList();
     }
 
-    private static String generateClassName(RangeMap.Range range) {
-        return DEFAULT_CLASS_NAME + "_" + range.getStart() + "_" + range.getEnd();
+    private static String generateClassName(Range range) {
+        if (range.getStart() == 0) {
+            return DEFAULT_CLASS_NAME;
+        } else {
+            return DEFAULT_CLASS_NAME + "_" + range.getStart() + "_" + range.getEnd();
+        }
     }
 
     private static List<ValueType> getGlobalTypes(Module module) {
@@ -454,8 +479,7 @@ public final class AotMachine implements Machine {
         }
     }
 
-    private MethodHandle[] compile(
-            RangeMap<ClassBytes> functionClassRanges, Map<String, Class<?>> classMap) {
+    private MethodHandle[] compile(RangeMap<ClassBytes> functionClassRanges) {
         var functions = module.functionSection();
         var compiled = new MethodHandle[functionImports + functions.functionCount()];
 
@@ -470,7 +494,7 @@ public final class AotMachine implements Machine {
                 MethodHandle handle =
                         publicLookup()
                                 .findStatic(
-                                        classMap.get(functionClassRanges.get(funcId).className()),
+                                        functionClassRanges.get(funcId).clazz(),
                                         methodNameFor(funcId),
                                         methodTypeFor(type));
                 handle =
@@ -482,20 +506,6 @@ public final class AotMachine implements Machine {
                 compiled[funcId] = adaptSignature(type, handle);
 
             } catch (ReflectiveOperationException e) {
-                //                System.out.println(e.getMessage());
-                //                Class<?> clazz = classMap.get(funcClassName(funcId));
-                //                System.out.println("Methods for class:  " + clazz.getName());
-                //                for (Method m : clazz.getMethods()) {
-                //                    System.out.println(
-                //                            m.getName()
-                //                                    + " "
-                //                                    + Arrays.stream(m.getParameterTypes())
-                //                                            .map(Class::getName)
-                //                                            .collect(Collectors.toList())
-                //                                    + "; "
-                //                                    + m.getReturnType().getName());
-                //                }
-
                 throw new ChicoryException(e);
             }
         }
@@ -504,7 +514,7 @@ public final class AotMachine implements Machine {
     }
 
     private byte[] compileClass(
-            RangeMap<ClassBytes> functionClassRanges, String className, RangeMap.Range range) {
+            RangeMap<ClassBytes> functionClassRanges, String className, Range range) {
         var internalClassName = AotUtil.toInternalClassName(className);
         var classWriter = new ClassWriter(ClassWriter.COMPUTE_FRAMES);
         classWriter.visit(
@@ -544,41 +554,6 @@ public final class AotMachine implements Machine {
                                         asm));
             }
         }
-        //        if(funcOffset <= functionImports) {
-        //            for (int i = funcOffset; i < (funcOffset + funcChunkSize) && i <
-        // functionImports; i++) {
-        //                funcId = i;
-        //                var type = functionTypes.get(funcId);
-        //                emitFunction(
-        //                        classWriter,
-        //                        methodNameFor(funcId),
-        //                        methodTypeFor(type),
-        //                        asm -> compileHostFunction(funcId, type, asm));
-        //            }
-        //        }
-        //
-        //        for (int i = funcOffset;
-        //                i < funcOffset + funcChunkSize && i < functions.functionCount();
-        //                i++) {
-        //            var funcId = functionImports + i;
-        //            var type = functionTypes.get(funcId);
-        //            var body = module.codeSection().getFunctionBody(i);
-        //
-        //            if (funcOffset == 0 || funcOffset == 50) {
-        //                System.out.println(
-        //                        "Emitting function:  "
-        //                                + className
-        //                                + "."
-        //                                + methodNameFor(funcId)
-        //                                + ", "
-        //                                + methodTypeFor(type));
-        //            }
-        //            emitFunction(
-        //                    classWriter,
-        //                    methodNameFor(funcId),
-        //                    methodTypeFor(type),
-        //                    asm -> compileBody(internalClassName, funcId, type, body, asm));
-        //        }
 
         var allTypes = module.typeSection().types();
         for (int i = 0; i < allTypes.length; i++) {
@@ -643,15 +618,12 @@ public final class AotMachine implements Machine {
         methodWriter.visitEnd();
     }
 
-    private Class<?> loadClass(
+    private static Class<?> loadClass(
             ByteArrayClassLoader classLoader, String className, byte[] classBytes) {
         try {
             Class<?> clazz = classLoader.loadFromBytes(className, classBytes);
             // force initialization to run JVM verifier
             Class.forName(clazz.getName(), true, clazz.getClassLoader());
-            //            System.out.println(
-            //                    "Initialize class:  " + clazz.getName() + ", " +
-            // clazz.getClassLoader());
             return clazz;
         } catch (ClassNotFoundException e) {
             throw new AssertionError(e);
@@ -1063,18 +1035,67 @@ public final class AotMachine implements Machine {
         return compiledClass;
     }
 
+    private class FuncGenAsync extends RecursiveAction {
+
+        private final RangeMap<ClassBytes> functionClassRanges;
+        private final List<Range> ranges;
+
+        public FuncGenAsync(RangeMap<ClassBytes> functionClassRanges, List<Range> ranges) {
+            this.functionClassRanges = functionClassRanges;
+            this.ranges = ranges;
+        }
+
+        @Override
+        protected void compute() {
+            if (ranges.size() == 1) {
+                FuncGenAsync child =
+                        new FuncGenAsync(
+                                functionClassRanges,
+                                genFuncClass(functionClassRanges, ranges.get(0)));
+                child.fork();
+                child.join();
+            } else if (ranges.size() > 1) {
+                List<FuncGenAsync> children =
+                        ranges.stream()
+                                .map(range -> new FuncGenAsync(functionClassRanges, List.of(range)))
+                                .collect(Collectors.toList());
+                invokeAll(children);
+            }
+        }
+    }
+
     static class ClassBytes {
         private final String className;
+        private boolean invalid;
         private byte[] bytes;
-        private Long generationTime;
+        private volatile Long generationTime;
+        private Class<?> clazz;
 
         public ClassBytes(String className) {
             this.className = className;
         }
 
-        public void addBytes(byte[] bytes, long generationTime) {
+        public void setBytes(byte[] bytes) {
+            if (bytes == null) {
+                throw new NullPointerException("bytes");
+            }
             this.bytes = bytes;
-            this.generationTime = generationTime;
+        }
+
+        public void setClass(Class<?> clazz) {
+            this.clazz = clazz;
+        }
+
+        public void setGenerationTime(Long generationTimeNanos) {
+            this.generationTime = generationTimeNanos;
+        }
+
+        public void invalidate() {
+            this.invalid = true;
+        }
+
+        public boolean isInvalid() {
+            return this.invalid;
         }
 
         public String className() {
@@ -1083,6 +1104,10 @@ public final class AotMachine implements Machine {
 
         public byte[] bytes() {
             return bytes;
+        }
+
+        public Class<?> clazz() {
+            return clazz;
         }
 
         public Long generationTime() {
@@ -1095,16 +1120,11 @@ public final class AotMachine implements Machine {
                     + "className='"
                     + className
                     + '\''
-                    + ", bytes.length="
-                    + bytes.length
+                    + ", invalid="
+                    + invalid
                     + ", generationTime="
                     + generationTime
                     + '}';
-        }
-
-        public void emptyBytes() {
-            this.bytes = null;
-            this.generationTime = null;
         }
     }
 }
