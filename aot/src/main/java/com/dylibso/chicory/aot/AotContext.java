@@ -21,6 +21,7 @@ import java.util.Map;
  */
 final class AotContext {
 
+    private final RangeMap<String> funcClassMap;
     private final String internalClassName;
     private final List<ValueType> globalTypes;
     private final List<FunctionType> functionTypes;
@@ -37,6 +38,7 @@ final class AotContext {
     private final Deque<Deque<StackSize>> restoreStackSize = new ArrayDeque<>();
 
     public AotContext(
+            RangeMap<String> funcClassMap,
             String internalClassName,
             List<ValueType> globalTypes,
             List<FunctionType> functionTypes,
@@ -44,6 +46,7 @@ final class AotContext {
             int funcId,
             FunctionType type,
             FunctionBody body) {
+        this.funcClassMap = funcClassMap;
         this.internalClassName = internalClassName;
         this.globalTypes = globalTypes;
         this.functionTypes = functionTypes;
@@ -77,6 +80,10 @@ final class AotContext {
         this.slots = List.copyOf(slots);
         this.tempSlot = slot;
         this.stackSizesStack.push(new ArrayDeque<>());
+    }
+
+    public String internalClassName(int funcId) {
+        return AotUtil.toInternalClassName(funcClassMap.get(funcId));
     }
 
     public String internalClassName() {

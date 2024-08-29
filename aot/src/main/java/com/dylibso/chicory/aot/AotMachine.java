@@ -45,7 +45,6 @@ import com.dylibso.chicory.wasm.types.AnnotatedInstruction;
 import com.dylibso.chicory.wasm.types.ExternalType;
 import com.dylibso.chicory.wasm.types.FunctionBody;
 import com.dylibso.chicory.wasm.types.FunctionImport;
-import com.dylibso.chicory.wasm.types.FunctionSection;
 import com.dylibso.chicory.wasm.types.FunctionType;
 import com.dylibso.chicory.wasm.types.Global;
 import com.dylibso.chicory.wasm.types.GlobalImport;
@@ -56,12 +55,7 @@ import com.dylibso.chicory.wasm.types.ValueType;
 import java.io.PrintWriter;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodType;
-import java.util.ArrayDeque;
-import java.util.HashMap;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Locale;
-import java.util.Map;
+import java.util.*;
 import java.util.function.Consumer;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
@@ -83,13 +77,13 @@ import org.objectweb.asm.util.CheckClassAdapter;
 public final class AotMachine implements Machine {
 
     public static final String DEFAULT_CLASS_NAME = "com.dylibso.chicory.$gen.CompiledModule";
-    public static final int CHUNK_SIZE = 15_000;
     private static final Instruction FUNCTION_SCOPE = new Instruction(-1, OpCode.NOP, new long[0]);
+    private static final int CONSTANT_POOL_UPPER_THRESHOLD = 45 * 1024;
 
     private final Module module;
     private final Instance instance;
     private final MethodHandle[] compiledFunctions;
-    private byte[] compiledClass;
+    private final byte[] compiledClass;
     private final List<ValueType> globalTypes;
     private final int functionImports;
     private final List<FunctionType> functionTypes;
@@ -318,20 +312,90 @@ public final class AotMachine implements Machine {
         this.functionImports = module.importSection().count(ExternalType.FUNCTION);
         this.functionTypes = getFunctionTypes(module);
 
-        Map<String, Class<?>> classes = new LinkedHashMap<>();
-        ByteArrayClassLoader classLoader = new ByteArrayClassLoader(getClass().getClassLoader());
-        for (int i = 0; i <= (functionImports + functionTypes.size()) / CHUNK_SIZE; i++) {
-            String className = DEFAULT_CLASS_NAME + "_" + i;
-            byte[] classBytes =
-                    compileClass(
-                            className, this.module.functionSection(), i * CHUNK_SIZE, CHUNK_SIZE);
-            classes.put(className, loadClass(classLoader, className, classBytes));
+        int functionCount = functionImports + module.functionSection().functionCount();
+        System.out.println(functionCount);
 
-            if (i == 0) {
-                this.compiledClass = classBytes; // TODO fix
+        long start = System.currentTimeMillis();
+        RangeMap<String> functionClassRanges = new RangeMap<>();
+        List<RangeMap.Range> rangesToProcess = new ArrayList<>();
+        rangesToProcess.add(new RangeMap.Range(0, functionCount - 1));
+        boolean split = false;
+        Map<String, byte[]> classBytesMap = new LinkedHashMap<>();
+        while (!rangesToProcess.isEmpty()) {
+            List<RangeMap.Range> splitRanges =
+                    generateFunctionRangeClass(
+                            functionClassRanges, rangesToProcess.remove(0), classBytesMap);
+            if (!splitRanges.isEmpty()) {
+                split = true;
+                rangesToProcess.addAll(0, splitRanges);
             }
         }
-        this.compiledFunctions = compile(classes);
+
+        if (split) {
+            functionClassRanges
+                    .entrySet()
+                    .forEach(
+                            entry -> {
+                                generateFunctionRangeClass(
+                                        functionClassRanges, entry.getKey(), classBytesMap);
+                            });
+        }
+        System.out.println("Elapsed generation time: " + (System.currentTimeMillis() - start));
+
+        for (Map.Entry<RangeMap.Range, String> entry : functionClassRanges.entrySet()) {
+            System.out.println("Range:  " + entry.getKey() + ", class:  " + entry.getValue());
+        }
+
+        // TODO address this
+        this.compiledClass = classBytesMap.entrySet().iterator().next().getValue();
+
+        start = System.currentTimeMillis();
+        Map<String, Class<?>> classes = new LinkedHashMap<>();
+        ByteArrayClassLoader classLoader = new ByteArrayClassLoader(getClass().getClassLoader());
+        for (Map.Entry<String, byte[]> entry : classBytesMap.entrySet()) {
+            classes.put(entry.getKey(), loadClass(classLoader, entry.getKey(), entry.getValue()));
+        }
+        System.out.println("Elapsed load time: " + (System.currentTimeMillis() - start));
+
+        start = System.currentTimeMillis();
+        this.compiledFunctions = compile(functionClassRanges, classes);
+        System.out.println("Elapsed compile time: " + (System.currentTimeMillis() - start));
+    }
+
+    private List<RangeMap.Range> generateFunctionRangeClass(
+            RangeMap<String> functionClassRanges,
+            RangeMap.Range functionRange,
+            Map<String, byte[]> classBytesMap) {
+        try {
+            String className = generateClassName(functionRange);
+            System.out.println(
+                    "Generating bytes for Range:  " + functionRange + ", class:  " + className);
+            functionClassRanges.put(functionRange, className);
+            byte[] classBytes = compileClass(functionClassRanges, className, functionRange);
+            classBytesMap.put(className, classBytes);
+        } catch (ClassTooLargeException e) {
+            functionClassRanges.remove(functionRange);
+            int splitCount = (e.getConstantPoolCount() / CONSTANT_POOL_UPPER_THRESHOLD) + 1;
+            System.out.println(
+                    "Class too large ("
+                            + e.getConstantPoolCount()
+                            + "), splitting range:  "
+                            + functionRange
+                            + " by "
+                            + splitCount);
+            List<RangeMap.Range> splitRanges = functionRange.split(splitCount);
+            for (RangeMap.Range range : splitRanges) {
+                functionClassRanges.put(range, generateClassName(range));
+            }
+
+            return splitRanges;
+        }
+
+        return Collections.emptyList();
+    }
+
+    private static String generateClassName(RangeMap.Range range) {
+        return DEFAULT_CLASS_NAME + "_" + range.getStart() + "_" + range.getEnd();
     }
 
     private static List<ValueType> getGlobalTypes(Module module) {
@@ -377,7 +441,8 @@ public final class AotMachine implements Machine {
         }
     }
 
-    private MethodHandle[] compile(Map<String, Class<?>> classMap) {
+    private MethodHandle[] compile(
+            RangeMap<String> functionClassRanges, Map<String, Class<?>> classMap) {
         var functions = module.functionSection();
         var compiled = new MethodHandle[functionImports + functions.functionCount()];
 
@@ -392,7 +457,7 @@ public final class AotMachine implements Machine {
                 MethodHandle handle =
                         publicLookup()
                                 .findStatic(
-                                        classMap.get(AotUtil.classNameFor(funcId)),
+                                        classMap.get(functionClassRanges.get(funcId)),
                                         methodNameFor(funcId),
                                         methodTypeFor(type));
                 handle =
@@ -426,10 +491,8 @@ public final class AotMachine implements Machine {
     }
 
     private byte[] compileClass(
-            String className, FunctionSection functions, int funcOffset, int funcChunkSize) {
-        var internalClassName = className.replace('.', '/');
-        System.out.println("Compiling class:  " + className + ", " + internalClassName);
-
+            RangeMap<String> functionClassRanges, String className, RangeMap.Range range) {
+        var internalClassName = AotUtil.toInternalClassName(className);
         var classWriter = new ClassWriter(ClassWriter.COMPUTE_FRAMES);
         classWriter.visit(
                 Opcodes.V11,
@@ -441,11 +504,12 @@ public final class AotMachine implements Machine {
         classWriter.visitSource("wasm", "wasm");
 
         emitConstructor(classWriter);
-
-        for (int funcId = funcOffset;
-                funcId < funcOffset + funcChunkSize
-                        && funcId < functionImports + functions.functionCount();
-                funcId++) {
+        System.out.println(
+                "functionImports: "
+                        + functionImports
+                        + ", functionTypes:  "
+                        + functionTypes.size());
+        for (int funcId = range.getStart(); funcId <= range.getEnd(); funcId++) {
             if (funcId < functionImports) {
                 int iFuncId = funcId;
                 var type = functionTypes.get(iFuncId);
@@ -462,7 +526,14 @@ public final class AotMachine implements Machine {
                         classWriter,
                         methodNameFor(fFuncId),
                         methodTypeFor(type),
-                        asm -> compileBody(internalClassName, fFuncId, type, body, asm));
+                        asm ->
+                                compileBody(
+                                        functionClassRanges,
+                                        internalClassName,
+                                        fFuncId,
+                                        type,
+                                        body,
+                                        asm));
             }
         }
         //        if(funcOffset <= functionImports) {
@@ -532,12 +603,6 @@ public final class AotMachine implements Machine {
 
         try {
             return classWriter.toByteArray();
-        } catch (ClassTooLargeException e) {
-            throw new ChicoryException(
-                    String.format(
-                            "JVM class too large for WASM module: %s constantPoolCount=%d",
-                            internalClassName, e.getConstantPoolCount()),
-                    e);
         } catch (MethodTooLargeException e) {
             throw new ChicoryException(
                     String.format(
@@ -694,6 +759,7 @@ public final class AotMachine implements Machine {
     }
 
     private void compileBody(
+            RangeMap<String> functionClassMap,
             String internalClassName,
             int funcId,
             FunctionType type,
@@ -702,6 +768,7 @@ public final class AotMachine implements Machine {
 
         var ctx =
                 new AotContext(
+                        functionClassMap,
                         internalClassName,
                         globalTypes,
                         functionTypes,

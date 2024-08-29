@@ -279,8 +279,8 @@ final class AotUtil {
                 false);
     }
 
-    public static String classNameFor(int funcId) {
-        return AotMachine.DEFAULT_CLASS_NAME + "_" + (funcId / AotMachine.CHUNK_SIZE);
+    public static String toInternalClassName(String className) {
+        return className.replace('.', '/');
     }
 
     public static String methodNameFor(int funcId) {
