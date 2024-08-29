@@ -35,6 +35,8 @@ import static org.objectweb.asm.Type.VOID_TYPE;
 import static org.objectweb.asm.Type.getInternalName;
 import static org.objectweb.asm.Type.getMethodDescriptor;
 
+import com.dylibso.chicory.log.Logger;
+import com.dylibso.chicory.log.SystemLogger;
 import com.dylibso.chicory.runtime.Instance;
 import com.dylibso.chicory.runtime.Machine;
 import com.dylibso.chicory.runtime.OpcodeImpl;
@@ -87,11 +89,12 @@ import org.objectweb.asm.util.CheckClassAdapter;
  */
 public final class AotMachine implements Machine {
 
+    private static final Logger logger = new SystemLogger();
     public static final String DEFAULT_CLASS_NAME = "com.dylibso.chicory.$gen.CompiledModule";
     private static final Instruction FUNCTION_SCOPE = new Instruction(-1, OpCode.NOP, new long[0]);
     private static final int CONSTANT_POOL_UPPER_THRESHOLD = 45 * 1024;
 
-    private static final WeakHashMap<com.dylibso.chicory.runtime.Module, RangeMap<ClassBytes>>
+    private static final WeakHashMap<com.dylibso.chicory.wasm.Module, RangeMap<ClassBytes>>
             MODULE_RANGE_MAP = new WeakHashMap<>();
 
     private final Module module;
@@ -336,9 +339,7 @@ public final class AotMachine implements Machine {
                                 instance.module(), m -> genFuncClassBytesMap(functionCount));
             }
 
-            long start = System.currentTimeMillis();
             this.compiledFunctions = compile(funcClassBytesMap);
-            System.out.println("Elapsed compile time: " + (System.currentTimeMillis() - start));
 
             // TODO address this
             this.compiledClass = funcClassBytesMap.get(0).bytes();
@@ -364,13 +365,13 @@ public final class AotMachine implements Machine {
                             .filter(entry -> entry.getValue().isInvalid())
                             .map(Map.Entry::getKey)
                             .collect(Collectors.toList());
-            System.out.println("Regenerating invalid:  " + invalidatedRanges);
             pool.invoke(new FuncGenAsync(funcRangeMap, invalidatedRanges));
         }
-        System.out.println("Elapsed generation time: " + (System.currentTimeMillis() - start));
+        logger.debugf(
+                "Elapsed AOT bytecode generation time: %d", (System.currentTimeMillis() - start));
 
         for (Map.Entry<Range, ClassBytes> entry : funcRangeMap.entrySet()) {
-            System.out.println("Range:  " + entry.getKey() + ", class:  " + entry.getValue());
+            logger.tracef("Range:  %s, class:  %s", entry.getKey(), entry.getValue());
         }
 
         start = System.currentTimeMillis();
@@ -380,7 +381,7 @@ public final class AotMachine implements Machine {
                         .map(cb -> loadClassAsync(cb, classLoader))
                         .collect(Collectors.toList());
         pool.invokeAll(loadTasks);
-        System.out.println("Elapsed load time: " + (System.currentTimeMillis() - start));
+        logger.debugf("Elapsed AOT class load time: %d", (System.currentTimeMillis() - start));
 
         return funcRangeMap;
     }
@@ -396,21 +397,16 @@ public final class AotMachine implements Machine {
             RangeMap<ClassBytes> functionClassRanges, Range functionRange) {
         try {
             String className = generateClassName(functionRange);
-            System.out.println(
-                    "Generating bytes for Range:  " + functionRange + ", class:  " + className);
+            logger.tracef("Generating bytes for Range:  %s, class: %s", functionRange, className);
             ClassBytes cb = new ClassBytes(className);
             functionClassRanges.put(functionRange, cb);
             cb.setGenerationTime(System.nanoTime());
             cb.setBytes(compileClass(functionClassRanges, className, functionRange));
         } catch (ClassTooLargeException e) {
             int splitCount = (e.getConstantPoolCount() / CONSTANT_POOL_UPPER_THRESHOLD) + 1;
-            System.out.println(
-                    "Class too large ("
-                            + e.getConstantPoolCount()
-                            + "), splitting range:  "
-                            + functionRange
-                            + " by "
-                            + splitCount);
+            logger.debugf(
+                    "Class too large (%d), splitting range:  %s by %d",
+                    e.getConstantPoolCount(), functionRange, splitCount);
             List<Range> splitRanges = functionRange.split(splitCount);
             //            splitRanges.add(1, splitRanges.remove(0)); // TODO remove
             for (Range range : splitRanges) {
@@ -425,10 +421,8 @@ public final class AotMachine implements Machine {
                                             && cb.generationTime() < splitEndNanos)
                     .peek(
                             cb ->
-                                    System.out.println(
-                                            "Flagging class "
-                                                    + cb.className()
-                                                    + " for re-generation."))
+                                    logger.tracef(
+                                            "Flagging class %s for re-generation.", cb.className()))
                     .forEach(ClassBytes::invalidate);
 
             return splitRanges;
@@ -489,6 +483,8 @@ public final class AotMachine implements Machine {
     }
 
     private MethodHandle[] compile(RangeMap<ClassBytes> functionClassRanges) {
+        long start = System.currentTimeMillis();
+
         var functions = module.functionSection();
         var compiled = new MethodHandle[functionImports + functions.functionCount()];
 
@@ -518,6 +514,7 @@ public final class AotMachine implements Machine {
                 throw new ChicoryException(e);
             }
         }
+        logger.debugf("Elapsed AOT compile time: %d", (System.currentTimeMillis() - start));
 
         return compiled;
     }

@@ -3,10 +3,10 @@ package com.dylibso.chicory.testing;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 import com.dylibso.chicory.aot.AotMachine;
-import com.dylibso.chicory.log.SystemLogger;
 import com.dylibso.chicory.runtime.ExportFunction;
-import com.dylibso.chicory.runtime.Module;
+import com.dylibso.chicory.runtime.Instance;
 import com.dylibso.chicory.wabt.Wat2Wasm;
+import com.dylibso.chicory.wasm.Parser;
 import com.dylibso.chicory.wasm.types.Value;
 import java.io.File;
 import java.io.PrintWriter;
@@ -20,12 +20,10 @@ public class LargeWasmTest {
         System.setProperty("java.util.logging.config.file", "logging.properties");
         System.out.println(new File(".").getAbsolutePath());
         var instance =
-                Module.builder(buildHugeWasm(50_000))
-                        .withLogger(new SystemLogger())
+                Instance.builder(Parser.parse(buildHugeWasm(50_000)))
                         .withMachineFactory(AotMachine::new)
                         .withStart(false)
-                        .build()
-                        .instantiate();
+                        .build();
 
         ExportFunction func1 = instance.export("func_1");
         assertEquals(42, func1.apply(Value.i32(50_045))[0].asInt());
