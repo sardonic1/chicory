@@ -58,6 +58,7 @@ import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodType;
 import java.util.ArrayDeque;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -65,6 +66,7 @@ import java.util.function.Consumer;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 import org.objectweb.asm.ClassReader;
+import org.objectweb.asm.ClassTooLargeException;
 import org.objectweb.asm.ClassVisitor;
 import org.objectweb.asm.ClassWriter;
 import org.objectweb.asm.Label;
@@ -81,12 +83,13 @@ import org.objectweb.asm.util.CheckClassAdapter;
 public final class AotMachine implements Machine {
 
     public static final String DEFAULT_CLASS_NAME = "com.dylibso.chicory.$gen.CompiledModule";
+    public static final int CHUNK_SIZE = 15_000;
     private static final Instruction FUNCTION_SCOPE = new Instruction(-1, OpCode.NOP, new long[0]);
 
     private final Module module;
     private final Instance instance;
     private final MethodHandle[] compiledFunctions;
-    private final byte[] compiledClass;
+    private byte[] compiledClass;
     private final List<ValueType> globalTypes;
     private final int functionImports;
     private final List<FunctionType> functionTypes;
@@ -315,8 +318,20 @@ public final class AotMachine implements Machine {
         this.functionImports = module.importSection().count(ExternalType.FUNCTION);
         this.functionTypes = getFunctionTypes(module);
 
-        this.compiledClass = compileClass(DEFAULT_CLASS_NAME, this.module.functionSection());
-        this.compiledFunctions = compile(loadClass(DEFAULT_CLASS_NAME, compiledClass));
+        Map<String, Class<?>> classes = new LinkedHashMap<>();
+        ByteArrayClassLoader classLoader = new ByteArrayClassLoader(getClass().getClassLoader());
+        for (int i = 0; i <= (functionImports + functionTypes.size()) / CHUNK_SIZE; i++) {
+            String className = DEFAULT_CLASS_NAME + "_" + i;
+            byte[] classBytes =
+                    compileClass(
+                            className, this.module.functionSection(), i * CHUNK_SIZE, CHUNK_SIZE);
+            classes.put(className, loadClass(classLoader, className, classBytes));
+
+            if (i == 0) {
+                this.compiledClass = classBytes; // TODO fix
+            }
+        }
+        this.compiledFunctions = compile(classes);
     }
 
     private static List<ValueType> getGlobalTypes(Module module) {
@@ -362,7 +377,7 @@ public final class AotMachine implements Machine {
         }
     }
 
-    private MethodHandle[] compile(Class<?> clazz) {
+    private MethodHandle[] compile(Map<String, Class<?>> classMap) {
         var functions = module.functionSection();
         var compiled = new MethodHandle[functionImports + functions.functionCount()];
 
@@ -376,7 +391,10 @@ public final class AotMachine implements Machine {
             try {
                 MethodHandle handle =
                         publicLookup()
-                                .findStatic(clazz, methodNameFor(funcId), methodTypeFor(type));
+                                .findStatic(
+                                        classMap.get(AotUtil.classNameFor(funcId)),
+                                        methodNameFor(funcId),
+                                        methodTypeFor(type));
                 handle =
                         insertArguments(
                                 handle,
@@ -386,6 +404,20 @@ public final class AotMachine implements Machine {
                 compiled[funcId] = adaptSignature(type, handle);
 
             } catch (ReflectiveOperationException e) {
+                //                System.out.println(e.getMessage());
+                //                Class<?> clazz = classMap.get(funcClassName(funcId));
+                //                System.out.println("Methods for class:  " + clazz.getName());
+                //                for (Method m : clazz.getMethods()) {
+                //                    System.out.println(
+                //                            m.getName()
+                //                                    + " "
+                //                                    + Arrays.stream(m.getParameterTypes())
+                //                                            .map(Class::getName)
+                //                                            .collect(Collectors.toList())
+                //                                    + "; "
+                //                                    + m.getReturnType().getName());
+                //                }
+
                 throw new ChicoryException(e);
             }
         }
@@ -393,8 +425,10 @@ public final class AotMachine implements Machine {
         return compiled;
     }
 
-    private byte[] compileClass(String className, FunctionSection functions) {
+    private byte[] compileClass(
+            String className, FunctionSection functions, int funcOffset, int funcChunkSize) {
         var internalClassName = className.replace('.', '/');
+        System.out.println("Compiling class:  " + className + ", " + internalClassName);
 
         var classWriter = new ClassWriter(ClassWriter.COMPUTE_FRAMES);
         classWriter.visit(
@@ -408,27 +442,64 @@ public final class AotMachine implements Machine {
 
         emitConstructor(classWriter);
 
-        for (int i = 0; i < functionImports; i++) {
-            int funcId = i;
-            var type = functionTypes.get(funcId);
-            emitFunction(
-                    classWriter,
-                    methodNameFor(funcId),
-                    methodTypeFor(type),
-                    asm -> compileHostFunction(funcId, type, asm));
+        for (int funcId = funcOffset;
+                funcId < funcOffset + funcChunkSize
+                        && funcId < functionImports + functions.functionCount();
+                funcId++) {
+            if (funcId < functionImports) {
+                int iFuncId = funcId;
+                var type = functionTypes.get(iFuncId);
+                emitFunction(
+                        classWriter,
+                        methodNameFor(funcId),
+                        methodTypeFor(type),
+                        asm -> compileHostFunction(iFuncId, type, asm));
+            } else {
+                var type = functionTypes.get(funcId);
+                var body = module.codeSection().getFunctionBody(funcId - functionImports);
+                int fFuncId = funcId;
+                emitFunction(
+                        classWriter,
+                        methodNameFor(fFuncId),
+                        methodTypeFor(type),
+                        asm -> compileBody(internalClassName, fFuncId, type, body, asm));
+            }
         }
-
-        for (int i = 0; i < functions.functionCount(); i++) {
-            var funcId = functionImports + i;
-            var type = functionTypes.get(funcId);
-            var body = module.codeSection().getFunctionBody(i);
-
-            emitFunction(
-                    classWriter,
-                    methodNameFor(funcId),
-                    methodTypeFor(type),
-                    asm -> compileBody(internalClassName, funcId, type, body, asm));
-        }
+        //        if(funcOffset <= functionImports) {
+        //            for (int i = funcOffset; i < (funcOffset + funcChunkSize) && i <
+        // functionImports; i++) {
+        //                funcId = i;
+        //                var type = functionTypes.get(funcId);
+        //                emitFunction(
+        //                        classWriter,
+        //                        methodNameFor(funcId),
+        //                        methodTypeFor(type),
+        //                        asm -> compileHostFunction(funcId, type, asm));
+        //            }
+        //        }
+        //
+        //        for (int i = funcOffset;
+        //                i < funcOffset + funcChunkSize && i < functions.functionCount();
+        //                i++) {
+        //            var funcId = functionImports + i;
+        //            var type = functionTypes.get(funcId);
+        //            var body = module.codeSection().getFunctionBody(i);
+        //
+        //            if (funcOffset == 0 || funcOffset == 50) {
+        //                System.out.println(
+        //                        "Emitting function:  "
+        //                                + className
+        //                                + "."
+        //                                + methodNameFor(funcId)
+        //                                + ", "
+        //                                + methodTypeFor(type));
+        //            }
+        //            emitFunction(
+        //                    classWriter,
+        //                    methodNameFor(funcId),
+        //                    methodTypeFor(type),
+        //                    asm -> compileBody(internalClassName, funcId, type, body, asm));
+        //        }
 
         var allTypes = module.typeSection().types();
         for (int i = 0; i < allTypes.length; i++) {
@@ -461,6 +532,12 @@ public final class AotMachine implements Machine {
 
         try {
             return classWriter.toByteArray();
+        } catch (ClassTooLargeException e) {
+            throw new ChicoryException(
+                    String.format(
+                            "JVM class too large for WASM module: %s constantPoolCount=%d",
+                            internalClassName, e.getConstantPoolCount()),
+                    e);
         } catch (MethodTooLargeException e) {
             throw new ChicoryException(
                     String.format(
@@ -493,13 +570,15 @@ public final class AotMachine implements Machine {
         methodWriter.visitEnd();
     }
 
-    private Class<?> loadClass(String className, byte[] classBytes) {
+    private Class<?> loadClass(
+            ByteArrayClassLoader classLoader, String className, byte[] classBytes) {
         try {
-            Class<?> clazz =
-                    new ByteArrayClassLoader(getClass().getClassLoader())
-                            .loadFromBytes(className, classBytes);
+            Class<?> clazz = classLoader.loadFromBytes(className, classBytes);
             // force initialization to run JVM verifier
             Class.forName(clazz.getName(), true, clazz.getClassLoader());
+            //            System.out.println(
+            //                    "Initialize class:  " + clazz.getName() + ", " +
+            // clazz.getClassLoader());
             return clazz;
         } catch (ClassNotFoundException e) {
             throw new AssertionError(e);

@@ -136,7 +136,7 @@ final class AotEmitters {
         asm.visitVarInsn(Opcodes.ALOAD, ctx.instanceSlot());
         asm.visitMethodInsn(
                 Opcodes.INVOKESTATIC,
-                ctx.internalClassName(),
+                AotUtil.classNameFor(funcId).replace('.', '/'),
                 methodNameFor(funcId),
                 methodType.toMethodDescriptorString(),
                 false);
